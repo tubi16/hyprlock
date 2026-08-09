@@ -20,6 +20,7 @@
 #include <cstring>
 #include <xf86drm.h>
 #include <algorithm>
+#include <array>
 #include <sdbus-c++/sdbus-c++.h>
 #include <hyprutils/os/Process.hpp>
 #include <malloc.h>
@@ -614,8 +615,45 @@ void CHyprlock::onKey(uint32_t key, bool down) {
         Log::logger->log(Log::ERR, "Invalid key down event (key already pressed?)");
         return;
     } else if (!down && std::ranges::find(m_vPressedKeys, key) == m_vPressedKeys.end()) {
-        Log::logger->log(Log::ERR, "Invalid key down event (stray release event?)");
-        return;
+        const auto SYM = xkb_state_key_get_one_sym(g_pSeatManager->m_pXKBState, key + 8);
+
+        // R5: All modifier and control keys must be silently ignored on stray release.
+        // Synthesizing a key-down for modifiers (especially Ctrl) would corrupt the
+        // modifier state and could trigger dangerous combinations like Ctrl+U (clear buffer).
+        static constexpr std::array<xkb_keysym_t, 14> STRAY_IGNORE_SYMS = {
+            XKB_KEY_Return,    XKB_KEY_KP_Enter,  XKB_KEY_Escape,
+            XKB_KEY_Control_L, XKB_KEY_Control_R,
+            XKB_KEY_Alt_L,     XKB_KEY_Alt_R,
+            XKB_KEY_Super_L,   XKB_KEY_Super_R,
+            XKB_KEY_Hyper_L,   XKB_KEY_Hyper_R,
+            XKB_KEY_Meta_L,    XKB_KEY_Meta_R,
+            XKB_KEY_Caps_Lock,
+        };
+
+        if (std::ranges::find(STRAY_IGNORE_SYMS, SYM) != STRAY_IGNORE_SYMS.end()) {
+            // R4: Downgraded from WARN to TRACE — this is expected behaviour on wake,
+            // not an actionable warning. WARN would create timing side-channel in logs.
+            Log::logger->log(Log::TRACE, "Stray release for control/modifier key (sym={:#x}). Ignoring.", (uint32_t)SYM);
+        } else if (SYM == XKB_KEY_Shift_L || SYM == XKB_KEY_Shift_R) {
+            // Shift stray release: the keyboard dropped the Shift KEY_DOWN due to hardware sleep.
+            // Because the missing Shift KEY_DOWN was never forwarded to XKB, any character typed
+            // while Shift was physically held will have been registered as lowercase.
+            // Workaround: uppercase the current buffer contents. This is safe only when the buffer
+            // is non-empty — if the buffer is empty, Shift was a lone wake-up keystroke and no
+            // correction is needed. Only ASCII a-z are transformed to preserve non-ASCII passwords.
+            if (!m_sPasswordState.passBuffer.empty()) {
+                Log::logger->log(Log::TRACE, "Stray Shift release with non-empty buffer. Uppercasing ASCII chars as wake-up workaround.");
+                for (auto& c : m_sPasswordState.passBuffer) {
+                    if (c >= 'a' && c <= 'z')
+                        c = c - 'a' + 'A';
+                }
+            } else {
+                Log::logger->log(Log::TRACE, "Stray Shift release with empty buffer. Lone wake-up keystroke, ignoring.");
+            }
+        } else {
+            Log::logger->log(Log::TRACE, "Stray key release (sym={:#x}). Keyboard likely dropped KEY_DOWN due to hardware sleep. Synthesizing key press.", (uint32_t)SYM);
+            onKey(key, true);
+        }
     }
 
     if (down)
